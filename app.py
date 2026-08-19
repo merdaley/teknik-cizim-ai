@@ -18,6 +18,7 @@ import fitz  # PyMuPDF
 import pandas as pd
 from PIL import Image
 import io
+import re
 from typing import Optional
 from google import genai
 from google.genai import types
@@ -49,6 +50,10 @@ class Malzeme(BaseModel):
     diameter_mm: Optional[float] = Field(None, description="Varsa Çap (Ø, Diameter) - mm")
     material: Optional[str] = Field(None, description="Malzeme türü (S355 vb.)")
     weight_kg: Optional[float] = Field(None, description="Birim Ağırlık (Weight/Item) - kg")
+    referans_cizim_numarasi: Optional[str] = Field(
+        None,
+        description="Bu malzeme satırı başka bir teknik çizime referans veriyorsa çizim no (Örn: 301107-3027). Hammadde satırlarında None."
+    )
 
 class CizimVerisi(BaseModel):
     cizim_numarasi: Optional[str] = Field(None, description="Sağ alt antetten çizim numarası")
@@ -81,12 +86,30 @@ def bom_pdf_oku(client, resim):
     )
     return json.loads(response.text)
 
+def cizim_referansi_mi(malzeme: dict) -> bool:
+    """Başka bir teknik çizime referans veren BOM satırlarını tespit eder."""
+    referans = str(malzeme.get("referans_cizim_numarasi") or "").strip()
+    if referans:
+        return True
+
+    # AI referans numarasını yanlış alana yazarsa da yakala.
+    # Örnek format: 301107-3027 (6 hane + tire + 4 hane)
+    kontrol_metni = " ".join(
+        str(malzeme.get(alan) or "")
+        for alan in ("name_of_item", "pos_no")
+    )
+    return bool(re.search(r"(?<!\d)\d{6}-\d{4}(?!\d)", kontrol_metni))
+
+
 def cizim_pdf_oku(client, resim):
     prompt = """
     Bu teknik çizim sayfasını incele:
     1. Sağ alttaki antetten 'Çizim Numarasını' bul.
-    2. Malzeme Listesi (BOM) tablosunu oku. Sadece hammaddeleri al.
-    3. Boyut stringlerini En, Boy, Kalınlık (t) ve Çap (Ø) olarak sayısal (float) ayrıştır.
+    2. Malzeme Listesi (BOM) tablosunu oku. SADECE gerçek hammaddeleri al (Plate, Flat Bar, Pipe, Profile vb.).
+    3. Başka bir teknik çizime/alt parçaya referans veren BOM satırlarını hammadde olarak kabul etme.
+       Özellikle 301107-3027, 301107-3073 gibi çizim numarası referansı bulunan satırları malzemeler listesine EKLEME.
+       Eğer böyle bir satırı yine de döndürmek zorunda kalırsan, referans numarasını 'referans_cizim_numarasi' alanına yaz.
+    4. Boyut stringlerini En, Boy, Kalınlık (t) ve Çap (Ø) olarak sayısal (float) ayrıştır.
     """
     response = client.models.generate_content(
         model='gemini-3.6-flash',
@@ -170,6 +193,11 @@ if st.button("Analizi Başlat", type="primary"):
                         carpan = montaj_carpanlari.get(cizim_no, 1)
                         
                         for malzeme in malzemeler:
+                            # 301107-3027 gibi başka bir teknik çizime referans veren
+                            # BOM satırlarını üretim Excel'ine alma.
+                            if cizim_referansi_mi(malzeme):
+                                continue
+
                             birim = malzeme.get("birim_miktar") or 1
                             malzeme_verisi = {
                                 "dosya_adi": dosya.name,
